@@ -1,5 +1,35 @@
 # Passive joint/contact regression
 
+## Archived experiment — 2026-11-05
+
+The Offroad owner shelved this fork for initial launch and retained stock Rapier
+0.35.3 for simplicity and safety. The implementation and regression tests remain
+available for post-launch research, not as an approved application dependency.
+The original implementation is `a26449b51e87b3cda844550c6b5e170e3ed6a9e1`;
+`archive/offroad-prelaunch-2026-11-05` preserves it with this documentation notice.
+
+Later application validation found sustained powered turns about 23% slower and
+slalom speed about 15% lower than both stock 0.35.3 and untouched upstream 0.36.1.
+Ablations isolated that difference to freezing friction warm-start estimates;
+it is not established as a more physically accurate tire response. Normal-only
+protection restored turn speed and passed the five crash cases, but introduced
+a thin-slab tunneling regression. A contact-history draft passed those collision
+cases but retained a substantial turn-speed change. Neither draft was adopted.
+
+Two additional upstream issues were investigated separately: incomplete support
+features for many-vertex convex wheel caps, and extreme-substep joint recovery
+velocities interacting with the linear speed cap. They do not justify weakening
+collision assertions or disabling the cap. The earlier validation below records
+what this patch passed, not a complete application adoption gate.
+
+Reconsider only after preserving ordinary handling while passing the original
+energy cases, thin-slab/core collision suites, native/Wasm parity and application
+integration checks, with fresh performance measurements. Detailed application
+records and unvalidated patches are retained in the local Offroad archive:
+`/Users/ian/Documents/Workspace/lolo/output/rapier-archive-2026-11-05/`.
+
+## Original investigation and validation
+
 A light wheel hitting a surface while attached to a much heavier chassis could
 create enough kinetic energy to launch the chassis. A two-body passive reproduction
 added 155 kJ in one 1/120-second step, with zero restitution and no motors or springs.
