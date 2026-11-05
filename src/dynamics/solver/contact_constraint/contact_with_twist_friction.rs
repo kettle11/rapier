@@ -20,6 +20,10 @@ pub struct TwistContactPointInfos<N: ScalarType> {
     // have the `tangent_vel` per-contact here.
     /// See [`super::contact_with_coulomb_friction::CoulombContactPointInfos::restitution_seed`].
     pub restitution_seed: N,
+    /// Warmstart estimate from the previous completed step. Keep this fixed across
+    /// substeps: a newly computed impact/stabilization impulse is not a prediction
+    /// of a continuing contact force, especially next to a stiff joint.
+    pub warmstart_impulse: N,
     pub local_p1: N::Vector,
     pub local_p2: N::Vector,
     pub dist: N,
@@ -29,6 +33,7 @@ impl<N: ScalarType> Default for TwistContactPointInfos<N> {
     fn default() -> Self {
         Self {
             restitution_seed: N::zero(),
+            warmstart_impulse: N::zero(),
             local_p1: Default::default(),
             local_p2: Default::default(),
             dist: N::zero(),
@@ -46,6 +51,9 @@ pub(crate) struct ContactWithTwistFrictionBuilder<N: ScalarType> {
     local_friction_center1: N::Vector,
     local_friction_center2: N::Vector,
     tangent_vel: N::Vector,
+    // Freeze the friction estimates along with the normal estimates.
+    warmstart_tangent_impulse: TangentImpulse<N>,
+    warmstart_twist_impulse: N,
     /// The contact normal in the first body's (com-centered) local frame, so
     /// `update` can re-derive the world normal without touching the manifold.
     local_n1: N::Vector,
@@ -296,6 +304,7 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
             out_builder.infos[k].local_p2 = poses2.inverse_transform_point(world_com2 + dp2);
             out_builder.infos[k].dist = dist - (point - (world_com2 + dp2)).gdot(force_dir1);
             out_builder.infos[k].restitution_seed = restitution_seed;
+            out_builder.infos[k].warmstart_impulse = out_constraint.normal_part[k].impulse;
         }
 
         /*
@@ -310,6 +319,8 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
             twist_warmstart.select(counts_simd.simd_gt(SimdReal::splat(1.0)), SimdReal::zero());
         out_constraint.twist_part.impulse_accumulator = -out_constraint.twist_part.impulse;
 
+        out_builder.warmstart_tangent_impulse = out_constraint.tangent_part.impulse;
+        out_builder.warmstart_twist_impulse = out_constraint.twist_part.impulse;
         out_builder.local_friction_center1 = poses1.inverse_transform_point(friction_center);
         out_builder.local_friction_center2 = poses2.inverse_transform_point(friction_center2);
 
@@ -499,7 +510,9 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
                 // Bank the previous substep's impulse before the warm-start scaling (see the
                 // coulomb-friction `update`).
                 normal_part.impulse_accumulator += normal_part.impulse;
-                normal_part.impulse *= warmstart_coeff;
+                // The accumulator records this step's actual impulses; the initial
+                // guess comes independently from the previous completed step.
+                normal_part.impulse = info.warmstart_impulse * warmstart_coeff;
             }
         }
 
@@ -513,9 +526,9 @@ impl ContactWithTwistFrictionBuilder<SimdReal> {
                 tangent_part.rhs[j] = tangent_part.rhs_wo_bias[j] + bias;
             }
             tangent_part.impulse_accumulator += tangent_part.impulse;
-            tangent_part.impulse *= warmstart_coeff;
+            tangent_part.impulse = self.warmstart_tangent_impulse * warmstart_coeff;
             twist_part.impulse_accumulator += twist_part.impulse;
-            twist_part.impulse *= warmstart_coeff;
+            twist_part.impulse = self.warmstart_twist_impulse * warmstart_coeff;
         }
 
         constraint.cfm_factor = cfm_factor;
@@ -879,6 +892,15 @@ mod test {
     fn generate_chunk(
         manifolds: [&ContactManifold; SIMD_WIDTH],
     ) -> ContactWithTwistFriction<SimdReal> {
+        generate_with_builder(manifolds).1
+    }
+
+    fn generate_with_builder(
+        manifolds: [&ContactManifold; SIMD_WIDTH],
+    ) -> (
+        ContactWithTwistFrictionBuilder<SimdReal>,
+        ContactWithTwistFriction<SimdReal>,
+    ) {
         let bodies = RigidBodySet::new();
         let solver_bodies = SolverBodies::default();
         let mut builder: ContactWithTwistFrictionBuilder<SimdReal> = unsafe { core::mem::zeroed() };
@@ -895,7 +917,7 @@ mod test {
             &mut builder,
             &mut constraint,
         );
-        constraint
+        (builder, constraint)
     }
 
     /// Mixed-count masking property for the twist kernel: active slots match the uniform
@@ -976,6 +998,49 @@ mod test {
                     );
                 }
             }
+        }
+    }
+
+    #[test]
+    fn substep_warmstart_does_not_feed_back_current_step_impulses() {
+        let manifold = test_manifold(MAX_MANIFOLD_POINTS, 2.0);
+        let bodies = SolverBodies::default();
+        let multibodies = MultibodyJointSet::new();
+        for coefficient in [0.0, 0.5, 1.0] {
+            let (builder, mut constraint) = generate_with_builder([&manifold; SIMD_WIDTH]);
+            let params = IntegrationParameters {
+                warmstart_coefficient: coefficient,
+                ..Default::default()
+            };
+            builder.update(&params, 0.0, &bodies, &multibodies, &mut constraint);
+            let normals = constraint.normal_part.map(|part| part.impulse);
+            for part in &mut constraint.normal_part {
+                part.impulse *= SimdReal::splat(10.0);
+            }
+
+            let tangent = constraint.tangent_part.impulse;
+            let twist = constraint.twist_part.impulse;
+            constraint.tangent_part.impulse *= SimdReal::splat(10.0);
+            constraint.twist_part.impulse *= SimdReal::splat(10.0);
+
+            // Model a transient impact ten times the cached support impulse. Its
+            // contribution must be reported, but must not seed the next substep.
+            builder.update(&params, params.dt, &bodies, &multibodies, &mut constraint);
+            for (part, expected) in constraint.normal_part.iter().zip(normals) {
+                assert_eq!(part.impulse, expected);
+                assert_eq!(part.impulse_accumulator, expected * SimdReal::splat(10.0));
+            }
+
+            assert_eq!(constraint.tangent_part.impulse, tangent);
+            assert_eq!(constraint.twist_part.impulse, twist);
+            assert_eq!(
+                constraint.tangent_part.impulse_accumulator,
+                tangent * SimdReal::splat(10.0)
+            );
+            assert_eq!(
+                constraint.twist_part.impulse_accumulator,
+                twist * SimdReal::splat(10.0)
+            );
         }
     }
 }

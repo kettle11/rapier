@@ -639,13 +639,23 @@ impl<N: ScalarType> JointConstraintHelper<N> {
         #[cfg(feature = "dim2")]
         let ang_jac = N::AngVector::one();
         #[cfg(feature = "dim3")]
-        let ang_jac = self.ang_basis.column(_locked_axis).into();
+        let ang_jac: N::AngVector = self.ang_basis.column(_locked_axis).into();
 
         let rhs_wo_bias = N::zero();
         #[cfg(feature = "dim2")]
         let rhs_bias = self.ang_err.imag() * erp_inv_dt;
         #[cfg(feature = "dim3")]
         let rhs_bias = self.ang_err.imag()[_locked_axis] * erp_inv_dt;
+        // Match angular-limit recovery without limiting physical angular velocity.
+        // This row differentiates a quaternion component, not an angle: its
+        // Jacobian is not unit length. Convert the angular-speed bound into row
+        // units, or a small/near-singular Jacobian can still demand a huge spin.
+        #[cfg(feature = "dim3")]
+        let jac_norm = ang_jac.gdot(ang_jac).simd_sqrt();
+        #[cfg(feature = "dim2")]
+        let jac_norm = N::one();
+        let max_bias = N::splat(_params.max_corrective_velocity()) * jac_norm;
+        let rhs_bias = rhs_bias.simd_clamp(-max_bias, max_bias);
 
         let ii_ang_jac1 = body1.ii.transform_vector(ang_jac);
         let ii_ang_jac2 = body2.ii.transform_vector(ang_jac);
@@ -841,6 +851,75 @@ mod test {
                     (slope - 1.0).abs() < 1.0e-2,
                     "center {center_deg} theta {theta_deg}: slope {slope}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod angular_recovery_tests {
+    use super::*;
+    use crate::math::{Pose, Rotation, Vector};
+
+    #[test]
+    fn angular_lock_recovery_is_bounded_in_angular_velocity_units() {
+        let body = JointSolverBody::<Real, 1>::invalid();
+        let unbounded = IntegrationParameters {
+            normalized_max_corrective_velocity: Real::MAX,
+            ..Default::default()
+        };
+        for angle in [-3.0, -0.5, -0.00001, 0.0, 0.00001, 0.5, 3.0] {
+            #[cfg(feature = "dim2")]
+            let rotation = Rotation::from_angle(angle);
+            #[cfg(feature = "dim3")]
+            let rotation = Rotation::from_axis_angle(Vector::X, angle);
+            let helper = JointConstraintHelper::<Real>::new(
+                &Pose::IDENTITY,
+                &Pose::from_rotation(rotation),
+                &Vector::ZERO,
+                &Vector::ZERO,
+                0,
+            );
+            for erp in [60.0, 960.0, 3840.0] {
+                let reference = helper.lock_angular(
+                    &unbounded,
+                    [0],
+                    &body,
+                    &body,
+                    0,
+                    WritebackId::Dof(DIM),
+                    erp,
+                    0.0,
+                );
+                #[cfg(feature = "dim3")]
+                let jac_norm = reference.ang_jac1.length();
+                #[cfg(feature = "dim2")]
+                let jac_norm = reference.ang_jac1.abs();
+                for max_recovery in [0.0, 3.0] {
+                    let params = IntegrationParameters {
+                        normalized_max_corrective_velocity: max_recovery,
+                        ..Default::default()
+                    };
+                    let mut row = helper.lock_angular(
+                        &params,
+                        [0],
+                        &body,
+                        &body,
+                        0,
+                        WritebackId::Dof(DIM),
+                        erp,
+                        0.0,
+                    );
+                    let bound = max_recovery * jac_norm;
+                    assert!((row.rhs / jac_norm).abs() <= max_recovery + 1.0e-5);
+                    if reference.rhs.abs() <= bound {
+                        assert_eq!(row.rhs, reference.rhs, "small errors must be unchanged");
+                    }
+                    assert_eq!(row.rhs_wo_bias, reference.rhs_wo_bias);
+                    assert_eq!(row.impulse_bounds, reference.impulse_bounds);
+                    row.remove_bias_from_rhs();
+                    assert_eq!(row.rhs, 0.0);
+                }
             }
         }
     }

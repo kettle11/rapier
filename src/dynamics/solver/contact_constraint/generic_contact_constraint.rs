@@ -366,6 +366,8 @@ impl GenericContactConstraintBuilder {
                 tangent_vel: manifold_point.tangent_velocity,
                 dist: dist - (point - point2).dot(force_dir1),
                 restitution_seed,
+                warmstart_impulse: out_constraint.normal_part[k].impulse,
+                warmstart_tangent_impulse: out_constraint.tangent_part[k].impulse,
             };
 
             out_builder.handle1 = handle1;
@@ -479,13 +481,14 @@ impl GenericContactConstraintBuilder {
                 // Bank the previous substep's impulse before the warm-start scaling (see the
                 // coulomb-friction `update`).
                 normal_part.impulse_accumulator += normal_part.impulse;
-                normal_part.impulse *= params.warmstart_coefficient;
+                normal_part.impulse = info.warmstart_impulse * params.warmstart_coefficient;
             }
 
             // Tangent part.
             {
                 tangent_part.impulse_accumulator += tangent_part.impulse;
-                tangent_part.impulse *= params.warmstart_coefficient;
+                tangent_part.impulse =
+                    info.warmstart_tangent_impulse * params.warmstart_coefficient;
 
                 for j in 0..DIM - 1 {
                     let bias = (p1 - p2).gdot(tangents1[j]) * inv_dt;

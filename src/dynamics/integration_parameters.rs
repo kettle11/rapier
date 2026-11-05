@@ -230,6 +230,8 @@ pub struct IntegrationParameters {
     /// The coefficient in `[0, 1]` applied to warmstart impulses, i.e., impulses that are used as the
     /// initial solution (instead of 0) at the next simulation step.
     ///
+    /// The estimate is taken from the previous completed step and kept fixed across
+    /// the current step's substeps; solved substep impulses are accumulated separately.
     /// This should generally be set to 1.
     ///
     /// (default `1.0`).
@@ -264,10 +266,11 @@ pub struct IntegrationParameters {
     ///
     /// This value is implicitly scaled by [`IntegrationParameters::length_unit`].
     pub normalized_allowed_linear_error: Real,
-    /// Maximum speed at which contact penetration is pushed out by the biased solve
+    /// Maximum speed of contact penetration and joint-limit recovery in the biased solve
     /// (default: `3.0`).
     ///
-    /// Capping this recovery velocity keeps deep penetrations from being resolved explosively.
+    /// Also bounds angular-lock recovery (after conversion to the constraint row's units).
+    /// Capping recovery keeps large positional errors from being resolved explosively.
     /// This value is implicitly scaled by [`IntegrationParameters::length_unit`].
     pub normalized_max_corrective_velocity: Real,
     /// The maximal distance separating two objects that will generate predictive contacts (default: `0.02`).
